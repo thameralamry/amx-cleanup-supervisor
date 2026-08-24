@@ -109,7 +109,8 @@ cd "$wp_root" || exit 70
 if [[ "$mode" == "preview" ]]; then
   echo "MODE: PREVIEW ONE PROPERTY; NO DELETION"
   set +e
-  AMX_MODE=preview AMX_LIMIT=1 wp eval-file "$batch_script" 2>&1 | tee "$run_out"
+  AMX_MODE=preview AMX_LIMIT=1 AMX_PRESELECT_LIMIT=10 \
+    wp eval-file "$batch_script" 2>&1 | tee "$run_out"
   preview_status=${PIPESTATUS[0]}
   set -e
 
