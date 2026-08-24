@@ -52,20 +52,12 @@ jobs:
           chmod 600 "$RUNNER_TEMP/amx-ssh/id_ed25519" "$RUNNER_TEMP/amx-ssh/known_hosts"
           ssh-keygen -y -f "$RUNNER_TEMP/amx-ssh/id_ed25519" >/dev/null
 
-      - name: Run restricted test or one resumable tick
+      - name: Run safe test or one split cleanup cycle
         shell: bash
         run: |
           set -euo pipefail
 
-          case "$REQUESTED_OPERATION" in
-            test) remote_command=amx-cleanup-test ;;
-            tick) remote_command=amx-cleanup-tick ;;
-            *) echo "Unsupported operation: $REQUESTED_OPERATION" >&2; exit 2 ;;
-          esac
-
-          output_file="$RUNNER_TEMP/amx-ssh/dispatcher-output.txt"
-          set +e
-          ssh \
+          ssh_args=(
             -i "$RUNNER_TEMP/amx-ssh/id_ed25519" \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -73,18 +65,45 @@ jobs:
             -o UserKnownHostsFile="$RUNNER_TEMP/amx-ssh/known_hosts" \
             -o ConnectTimeout=30 \
             -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=40 \
-            "$SSH_USER@$SSH_HOST" \
-            "SSH_ORIGINAL_COMMAND=$remote_command /srv/htdocs/.amx-cleanup/amx-external-dispatch.sh" \
-            | tee "$output_file"
-          ssh_status=${PIPESTATUS[0]}
-          set -e
+            -o ServerAliveCountMax=40
+          )
+
+          run_remote() {
+            local remote_command="$1"
+            ssh "${ssh_args[@]}" "$SSH_USER@$SSH_HOST" \
+              "SSH_ORIGINAL_COMMAND=$remote_command /srv/htdocs/.amx-cleanup/amx-external-dispatch.sh"
+          }
 
           if [[ "$REQUESTED_OPERATION" == "test" ]]; then
-            grep -Fxq 'MODE: TEST ONLY; TICK NOT CALLED' "$output_file"
-            grep -Fxq 'status=NOT_STARTED' "$output_file"
-            grep -Fxq 'runner=INACTIVE' "$output_file"
-            grep -Fxq 'DISPATCHER_OK' "$output_file"
+            test_output="$RUNNER_TEMP/amx-ssh/test-output.txt"
+            run_remote amx-cleanup-test | tee "$test_output"
+            grep -Fxq 'MODE: TEST ONLY; PREVIEW AND EXECUTE NOT CALLED' "$test_output"
+            grep -Fxq 'DISPATCHER_OK' "$test_output"
+            exit 0
           fi
+          [[ "$REQUESTED_OPERATION" == "tick" ]] || {
+            echo "Unsupported operation: $REQUESTED_OPERATION" >&2
+            exit 2
+          }
 
-          exit "$ssh_status"
+          preview_output="$RUNNER_TEMP/amx-ssh/preview-output.txt"
+          set +e
+          run_remote amx-cleanup-preview | tee "$preview_output"
+          preview_status=${PIPESTATUS[0]}
+          set -e
+          (( preview_status == 0 )) || exit "$preview_status"
+
+          if grep -Eq '^STATUS: (ALREADY_COMPLETE|NO_MORE_SAFE_PROPERTIES|RETRY_ON_NEXT_SCHEDULE)$' "$preview_output"; then
+            exit 0
+          fi
+          grep -Fxq 'STATUS: PREVIEW_COMPLETE_NO_DELETION' "$preview_output"
+          grep -Fxq 'SELECTED PROPERTIES: 1' "$preview_output"
+          grep -Fxq 'MISSING DERIVATIVE REFERENCES: 0' "$preview_output"
+          grep -Fxq 'DISPATCHER_PREVIEW_OK' "$preview_output"
+
+          execute_output="$RUNNER_TEMP/amx-ssh/execute-output.txt"
+          run_remote amx-cleanup-execute | tee "$execute_output"
+          grep -Fxq 'STATUS: COMPLETE' "$execute_output"
+          grep -Fxq 'PROPERTIES CLEANED: 1' "$execute_output"
+          grep -Fxq 'FAILED: 0' "$execute_output"
+          grep -Fxq 'DISPATCHER_EXECUTE_OK' "$execute_output"
