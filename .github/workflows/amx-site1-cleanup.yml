@@ -12,13 +12,13 @@ on:
           - test
           - tick
   schedule:
-    - cron: "3,18,33,48 * * * *"
+    - cron: "0,5,10,15,20,25,30,35,40,45,50,55 * * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: amx-site1-cleanup
+  group: amx-bluehost-cleanup
   cancel-in-progress: false
 
 jobs:
