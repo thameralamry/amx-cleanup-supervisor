@@ -1,1 +1,59 @@
+name: AMX Site 2 Cleanup
 
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10,25,40,55 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: amx-site2-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup_tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    env:
+      SSH_HOST: ${{ secrets.AMX_SITE2_HOST }}
+      SSH_USER: ${{ secrets.AMX_SITE2_USER }}
+      SSH_PRIVATE_KEY: ${{ secrets.AMX_SITE2_SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.AMX_ATOMIC_KNOWN_HOSTS }}
+    steps:
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SSH_HOST"
+          test -n "$SSH_USER"
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
+
+      - name: Configure restricted SSH identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/amx-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/amx-ssh/id_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/amx-ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/amx-ssh/id_ed25519" "$RUNNER_TEMP/amx-ssh/known_hosts"
+          ssh-keygen -y -f "$RUNNER_TEMP/amx-ssh/id_ed25519" >/dev/null
+
+      - name: Run one safe resumable batch
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -i "$RUNNER_TEMP/amx-ssh/id_ed25519" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$RUNNER_TEMP/amx-ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=40 \
+            "$SSH_USER@$SSH_HOST" \
+            amx-cleanup-tick
