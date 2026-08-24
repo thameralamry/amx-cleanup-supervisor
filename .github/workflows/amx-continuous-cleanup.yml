@@ -1,0 +1,206 @@
+name: AMX Continuous Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      cycles:
+        description: "Cycles in this runner (one cycle cleans at most one property per site)"
+        required: true
+        default: "30"
+        type: choice
+        options:
+          - "1"
+          - "30"
+      chain:
+        description: "Automatically hand off to a fresh runner"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: amx-bluehost-cleanup
+  cancel-in-progress: false
+
+jobs:
+  continuous_cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      SITE1_HOST: ${{ secrets.AMX_SITE1_HOST }}
+      SITE1_USER: ${{ secrets.AMX_SITE1_USER }}
+      SITE1_KEY_B64: ${{ secrets.AMX_SITE1_SSH_KEY }}
+      SITE2_HOST: ${{ secrets.AMX_SITE2_HOST }}
+      SITE2_USER: ${{ secrets.AMX_SITE2_USER }}
+      SITE2_KEY_B64: ${{ secrets.AMX_SITE2_SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.AMX_ATOMIC_KNOWN_HOSTS }}
+      REQUESTED_CYCLES: ${{ inputs.cycles }}
+    steps:
+      - name: Validate and configure both restricted SSH identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          for value in "$SITE1_HOST" "$SITE1_USER" "$SITE1_KEY_B64" "$SITE2_HOST" "$SITE2_USER" "$SITE2_KEY_B64" "$SSH_KNOWN_HOSTS"; do
+            test -n "$value"
+          done
+          [[ "$REQUESTED_CYCLES" =~ ^[0-9]+$ ]]
+          (( REQUESTED_CYCLES >= 1 && REQUESTED_CYCLES <= 30 ))
+
+          umask 077
+          mkdir -p "$RUNNER_TEMP/amx-ssh"
+          printf '%s' "$SITE1_KEY_B64" | base64 --decode > "$RUNNER_TEMP/amx-ssh/site1_ed25519"
+          printf '%s' "$SITE2_KEY_B64" | base64 --decode > "$RUNNER_TEMP/amx-ssh/site2_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/amx-ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/amx-ssh/site1_ed25519" "$RUNNER_TEMP/amx-ssh/site2_ed25519" "$RUNNER_TEMP/amx-ssh/known_hosts"
+          ssh-keygen -y -f "$RUNNER_TEMP/amx-ssh/site1_ed25519" >/dev/null
+          ssh-keygen -y -f "$RUNNER_TEMP/amx-ssh/site2_ed25519" >/dev/null
+
+      - name: Clean both sites safely every five minutes
+        id: cleanup
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          run_remote() {
+            local host="$1"
+            local user="$2"
+            local key_file="$3"
+            local remote_command="$4"
+            ssh \
+              -i "$key_file" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$RUNNER_TEMP/amx-ssh/known_hosts" \
+              -o ConnectTimeout=30 \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=40 \
+              "$user@$host" \
+              "SSH_ORIGINAL_COMMAND=$remote_command /srv/htdocs/.amx-cleanup/amx-external-dispatch.sh"
+          }
+
+          require_line() {
+            local expected="$1"
+            local file="$2"
+            grep -Fxq "$expected" "$file" || {
+              echo "Safety validation failed: $expected" >&2
+              return 1
+            }
+          }
+
+          run_site_tick() {
+            local label="$1"
+            local host="$2"
+            local user="$3"
+            local key_file="$4"
+            local cycle="$5"
+            local preview_output="$RUNNER_TEMP/amx-ssh/${label}-${cycle}-preview.txt"
+            local execute_output="$RUNNER_TEMP/amx-ssh/${label}-${cycle}-execute.txt"
+            local remote_status
+
+            echo "::group::${label} cycle ${cycle} preview"
+            run_remote "$host" "$user" "$key_file" amx-cleanup-preview | tee "$preview_output"
+            remote_status=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            (( remote_status == 0 )) || return "$remote_status"
+
+            if grep -Eq '^STATUS: (ALREADY_COMPLETE|NO_MORE_SAFE_PROPERTIES)$' "$preview_output"; then
+              echo "$label reports no remaining safe work."
+              return 20
+            fi
+            if grep -Fxq 'STATUS: RETRY_ON_NEXT_SCHEDULE' "$preview_output"; then
+              echo "$label requested a safe retry on the next cycle."
+              return 0
+            fi
+
+            require_line 'STATUS: PREVIEW_COMPLETE_NO_DELETION' "$preview_output" || return 1
+            require_line 'SELECTED PROPERTIES: 1' "$preview_output" || return 1
+            require_line 'MISSING DERIVATIVE REFERENCES: 0' "$preview_output" || return 1
+            require_line 'DISPATCHER_PREVIEW_OK' "$preview_output" || return 1
+
+            echo "::group::${label} cycle ${cycle} execute"
+            run_remote "$host" "$user" "$key_file" amx-cleanup-execute | tee "$execute_output"
+            remote_status=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            (( remote_status == 0 )) || return "$remote_status"
+
+            require_line 'STATUS: COMPLETE' "$execute_output" || return 1
+            require_line 'PROPERTIES CLEANED: 1' "$execute_output" || return 1
+            require_line 'FAILED: 0' "$execute_output" || return 1
+            require_line 'DISPATCHER_EXECUTE_OK' "$execute_output" || return 1
+
+            {
+              echo "### ${label} — cycle ${cycle}"
+              grep -E '^(PROPERTY ID|FILES DELETED|BYTES FREED|STATUS):' "$execute_output" || true
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+            return 0
+          }
+
+          site1_done=false
+          site2_done=false
+
+          for ((cycle = 1; cycle <= REQUESTED_CYCLES; cycle++)); do
+            cycle_started=$(date +%s)
+            echo "Starting safe cleanup cycle $cycle of $REQUESTED_CYCLES"
+
+            if [[ "$site1_done" != true ]]; then
+              run_site_tick "Site 1" "$SITE1_HOST" "$SITE1_USER" "$RUNNER_TEMP/amx-ssh/site1_ed25519" "$cycle"
+              site_status=$?
+              if (( site_status == 20 )); then
+                site1_done=true
+              elif (( site_status != 0 )); then
+                echo "Site 1 stopped on a safety or connection failure." >&2
+                exit "$site_status"
+              fi
+            fi
+
+            if [[ "$site2_done" != true ]]; then
+              run_site_tick "Site 2" "$SITE2_HOST" "$SITE2_USER" "$RUNNER_TEMP/amx-ssh/site2_ed25519" "$cycle"
+              site_status=$?
+              if (( site_status == 20 )); then
+                site2_done=true
+              elif (( site_status != 0 )); then
+                echo "Site 2 stopped on a safety or connection failure." >&2
+                exit "$site_status"
+              fi
+            fi
+
+            if [[ "$site1_done" == true && "$site2_done" == true ]]; then
+              echo "continue=false" >> "$GITHUB_OUTPUT"
+              echo "Both sites report that safe cleanup is complete." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
+            if (( cycle < REQUESTED_CYCLES )); then
+              elapsed=$(( $(date +%s) - cycle_started ))
+              remaining=$(( 300 - elapsed ))
+              if (( remaining > 0 )); then
+                echo "Cycle finished in ${elapsed}s; waiting ${remaining}s before the next cycle."
+                sleep "$remaining"
+              else
+                echo "Cycle took ${elapsed}s; the next safe cycle starts now."
+              fi
+            fi
+          done
+
+          echo "continue=true" >> "$GITHUB_OUTPUT"
+
+      - name: Hand off to a fresh background runner
+        if: ${{ steps.cleanup.outputs.continue == 'true' && inputs.chain }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/amx-continuous-cleanup.yml/dispatches" \
+            --data '{"ref":"main","inputs":{"cycles":"30","chain":"true"}}'
+          echo "A fresh runner has been queued to continue safely." >> "$GITHUB_STEP_SUMMARY"
