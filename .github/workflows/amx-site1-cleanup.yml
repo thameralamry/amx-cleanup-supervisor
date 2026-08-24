@@ -19,7 +19,7 @@ jobs:
     env:
       SSH_HOST: ${{ secrets.AMX_SITE1_HOST }}
       SSH_USER: ${{ secrets.AMX_SITE1_USER }}
-      SSH_PRIVATE_KEY: ${{ secrets.AMX_SITE1_SSH_KEY }}
+      SSH_PRIVATE_KEY_B64: ${{ secrets.AMX_SITE1_SSH_KEY }}
       SSH_KNOWN_HOSTS: ${{ secrets.AMX_ATOMIC_KNOWN_HOSTS }}
     steps:
       - name: Validate required secrets
@@ -28,7 +28,7 @@ jobs:
           set -euo pipefail
           test -n "$SSH_HOST"
           test -n "$SSH_USER"
-          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_PRIVATE_KEY_B64"
           test -n "$SSH_KNOWN_HOSTS"
 
       - name: Configure restricted SSH identity
@@ -37,7 +37,7 @@ jobs:
           set -euo pipefail
           umask 077
           mkdir -p "$RUNNER_TEMP/amx-ssh"
-          printf '%s\n' "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/amx-ssh/id_ed25519"
+          printf '%s' "$SSH_PRIVATE_KEY_B64" | base64 --decode > "$RUNNER_TEMP/amx-ssh/id_ed25519"
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/amx-ssh/known_hosts"
           chmod 600 "$RUNNER_TEMP/amx-ssh/id_ed25519" "$RUNNER_TEMP/amx-ssh/known_hosts"
           ssh-keygen -y -f "$RUNNER_TEMP/amx-ssh/id_ed25519" >/dev/null
